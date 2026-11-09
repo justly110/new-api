@@ -1,0 +1,197 @@
+name: Auto Sync Upstream Release, Patch and Build
+
+on:
+  schedule:
+    # 每 2 小时检查一次上游是否有新 Release
+    - cron: '0 */2 * * *'
+  # 支持在网页手动触发
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: '指定上游 Tag 强制构建（如 v1.0.0-rc.49），留空则自动检测最新 Release'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+# 同一时间只允许一个构建任务，避免并发导致重复发布
+concurrency:
+  group: auto-sync-build
+  cancel-in-progress: false
+
+env:
+  # 保留的 Release 版本数量（含最新构建的）
+  KEEP_RELEASES: 2
+
+jobs:
+  check-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 检查上游最新 Release，并判断是否需要构建
+      - name: Check upstream latest release
+        id: check_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.force_tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TARGET_TAG="$INPUT_TAG"
+            echo "Manual build specified tag: $TARGET_TAG"
+          else
+            TARGET_TAG=$(gh release view --repo QuantumNous/new-api --json tagName --jq .tagName)
+            echo "Upstream latest release tag: $TARGET_TAG"
+          fi
+
+          if [ -z "$TARGET_TAG" ]; then
+            echo "::error::Could not find upstream release tag"
+            exit 1
+          fi
+
+          # 你的仓库使用 <上游tag>-patched 作为独立 Release tag，避免与 fork 继承的 tag 冲突
+          RELEASE_TAG="${TARGET_TAG}-patched"
+          echo "target_tag=${TARGET_TAG}" >> $GITHUB_OUTPUT
+          echo "release_tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
+
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 && [ -z "$INPUT_TAG" ]; then
+            echo "Release ${RELEASE_TAG} already exists. No new upstream release, skipping."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "Proceeding to build: ${TARGET_TAG} -> ${RELEASE_TAG}"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+      # 2. 检出上游对应 Release 的 Tag 代码
+      - name: Checkout upstream tag
+        if: steps.check_release.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: QuantumNous/new-api
+          ref: ${{ steps.check_release.outputs.target_tag }}
+          fetch-depth: 0
+
+      # 3. 修改 main.go：监听地址改为 127.0.0.1
+      - name: Patch main.go (Bind Addr to 127.0.0.1)
+        if: steps.check_release.outputs.should_build == 'true'
+        run: |
+          echo "Before patch:"
+          grep -n 'Addr:' main.go || true
+
+          sed -i 's/Addr:[[:space:]]*":"[[:space:]]*+[[:space:]]*port/Addr: "127.0.0.1:" + port/' main.go
+
+          echo "After patch:"
+          grep -n 'Addr:' main.go
+
+          if ! grep -q '127.0.0.1' main.go; then
+            echo "::error::Patch failed! Target string not found in main.go"
+            exit 1
+          fi
+
+      # 4. 构建前端（前端产物是 go:embed 依赖，必须先构建）
+      - name: Set up Bun (for Frontend)
+        if: steps.check_release.outputs.should_build == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+
+      - name: Build Frontend
+        if: steps.check_release.outputs.should_build == 'true'
+        env:
+          CI: ""
+        run: |
+          cd web
+          bun install --frozen-lockfile
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION="${{ steps.check_release.outputs.target_tag }}" bun run build
+          cd ..
+
+      # 5. 设置 Go 环境
+      - name: Set up Go
+        if: steps.check_release.outputs.should_build == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 6. 编译并打包（Linux amd64）
+      - name: Build Backend (Linux amd64)
+        if: steps.check_release.outputs.should_build == 'true'
+        run: |
+          go mod download
+          TAG="${{ steps.check_release.outputs.target_tag }}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=${TAG}' -extldflags '-static'" \
+            -o new-api-linux-amd64 main.go
+          tar -czvf "new-api-linux-amd64-${TAG}.tar.gz" new-api-linux-amd64
+          ls -lh new-api-linux-amd64*.tar.gz
+
+      # 7. 发布 Release 并上传附件（纯 API 方式，不依赖 git tag/本地历史）
+      - name: Publish to GitHub Release
+        if: steps.check_release.outputs.should_build == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET_TAG="${{ steps.check_release.outputs.target_tag }}"
+          RELEASE_TAG="${{ steps.check_release.outputs.release_tag }}"
+
+          UPSTREAM_NOTES=$(gh release view "${TARGET_TAG}" --repo QuantumNous/new-api --json body --jq .body || true)
+
+          # 如果 Release 已存在（force 重跑），先删掉再重建，避免重复
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} exists, deleting for rebuild..."
+            gh release delete "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag
+          fi
+
+          # 用 API 创建 Release（tag 自动创建，指向默认分支最新提交）
+          gh api "repos/${GITHUB_REPOSITORY}/releases" \
+            -f tag_name="${RELEASE_TAG}" \
+            -f name="Release ${TARGET_TAG} (Patched 127.0.0.1)" \
+            -f body="本版本基于上游官方 Release [${TARGET_TAG}](https://github.com/QuantumNous/new-api/releases/tag/${TARGET_TAG}) 自动构建。
+
+          **修改说明**：已自动将 \`main.go\` 中的监听地址由 \`:\$port\` 替换为 \`127.0.0.1:\$port\`。
+
+          ---
+          ### 上游官方更新日志：
+          ${UPSTREAM_NOTES}" \
+            > release.json
+
+          # 用 upload_url 上传附件，绕过 gh release 的 tag 校验
+          UPLOAD_URL=$(jq -r .upload_url release.json | sed 's/{?name,label}//')
+          echo "Upload URL: ${UPLOAD_URL}"
+
+          for FILE in new-api-*.tar.gz; do
+            echo "Uploading ${FILE} ..."
+            curl -sS -X POST \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/gzip" \
+              --data-binary "@${FILE}" \
+              "${UPLOAD_URL}?name=${FILE}" > upload.json
+            jq -r '.name // .message' upload.json
+          done
+
+          echo "Release ${RELEASE_TAG} published."
+
+      # 8. 清理旧 Release，只保留最近 KEEP_RELEASES 个 -patched 版本
+      - name: Cleanup old releases
+        if: always() && steps.check_release.outputs.should_build == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          KEEP="${KEEP_RELEASES:-2}"
+          echo "Keeping latest ${KEEP} patched releases."
+
+          # 按创建时间倒序列出所有 -patched Release，删除第 KEEP 个之后的
+          gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 \
+            --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[] | select(.tagName | endswith("-patched")) | .tagName' \
+            | tail -n +$((KEEP + 1)) \
+            | while read -r TAG; do
+                [ -z "$TAG" ] && continue
+                echo "Deleting old release: ${TAG}"
+                gh release delete "${TAG}" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag || echo "Failed to delete ${TAG}, continue."
+              done
+
+          echo "Remaining patched releases:"
+          gh release list --repo "${GITHUB_REPOSITORY}" --limit 20 \
+            --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[] | select(.tagName | endswith("-patched")) | "\(.createdAt)  \(.tagName)"'
